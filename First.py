@@ -4,6 +4,7 @@ from pydub import AudioSegment
 from langdetect import detect, DetectorFactory
 from typing import List, Dict, Tuple
 import warnings
+import numpy
 
 DetectorFactory.seed = 0
 warnings.filterwarnings("ignore")
