@@ -1,26 +1,71 @@
 import os
 import json
-from pydub import AudioSegment
-from langdetect import detect, DetectorFactory
-from typing import List, Dict, Tuple
 import warnings
-import numpy
+from typing import List, Tuple, Dict
+
+import numpy as np
+from pydub import AudioSegment
+from langdetect import detect
+from langdetect.detector_factory import DetectorFactory
+
+# FFmpeg setup
+os.environ["PATH"] += os.pathsep + r"C:\ffmpeg\bin"
+AudioSegment.converter = r"C:\ffmpeg\bin\ffmpeg.exe"
 
 DetectorFactory.seed = 0
 warnings.filterwarnings("ignore")
 
-# ---------------- LANGUAGE DETECTION ----------------
-def detect_language(text: str) -> str:
-    lang = detect(text)
-    return "en" if lang == "en" else "hi"
+# ------------------- PHONEME TO VISEME MAPPING -------------------
+phoneme_to_viseme = {
+    "A": ["m", "b", "p", "em", "bm", "i"],
+    "B": ["d", "t", "n", "l", "s", "z", "e", "nd", "nt"],
+    "C": ["k", "g", "gh", "kh", "ng"],
+    "D": ["r", "rr", "ll", "ey", "er", "dh"],
+    "E": ["u", "uw", "o", "w", "wh", "ch", "jh", "sh", "zh", "th"],
+    "F": ["f", "v"],
+    "G": ["hh", "h", "uh", "ih"],
+    "H": ["aa", "ae", "ah", "ao", "aw", "ay", "a", "eh", "iy", "ee", "y"],
+    "X": [" ", "sil", "sp", "pause"]
+}
 
-# ---------------- PHONEME EXTRACTION ----------------
+def map_to_viseme(phoneme: str) -> str:
+    for viseme, phonemes in phoneme_to_viseme.items():
+        if phoneme in phonemes:
+            return viseme
+    return "X"
+
+def detect_language(text: str) -> str:
+    return detect(text)
+
 def get_phonemes_en(text: str) -> List[str]:
     try:
-        from eng_to_ipa import convert
-        ipa = convert(text, stress_marks=False, punctuation=False)
-        ipa = ipa.replace("ˈ", "").replace("ˌ", "").replace("ɹ", "r")
-        return [p for p in ipa if p.isalpha()]
+        from eng_to_ipa import convert as ipa_convert
+        ipa_text = ipa_convert(text)
+        ipa_to_phoneme = {
+            'i': 'iy', 'ɪ': 'ih', 'e': 'ey', 'ɛ': 'eh', 'æ': 'ae',
+            'ɑ': 'aa', 'ʌ': 'ah', 'ɔ': 'ao', 'ʊ': 'uh', 'u': 'uw',
+            'aʊ': 'aw', 'aɪ': 'ay', 'ɔɪ': 'oy', 'oʊ': 'ow',
+            'p': 'p', 'b': 'b', 't': 't', 'd': 'd', 'k': 'k', 'ɡ': 'g',
+            'm': 'm', 'n': 'n', 'ŋ': 'ng', 'f': 'f', 'v': 'v',
+            'θ': 'th', 'ð': 'dh', 's': 's', 'z': 'z', 'ʃ': 'sh', 'ʒ': 'zh',
+            'h': 'hh', 'l': 'l', 'r': 'r', 'j': 'y', 'w': 'w',
+            'tʃ': 'ch', 'dʒ': 'jh', ' ': ' '
+        }
+        phonemes = []
+        i = 0
+        while i < len(ipa_text):
+            found = False
+            for length in [2, 1]:
+                if i + length <= len(ipa_text):
+                    substr = ipa_text[i:i + length]
+                    if substr in ipa_to_phoneme:
+                        phonemes.append(ipa_to_phoneme[substr])
+                        i += length
+                        found = True
+                        break
+            if not found:
+                i += 1
+        return phonemes
     except:
         return list(text)
 
@@ -37,7 +82,7 @@ def get_phonemes_hi_gu(text: str) -> List[str]:
     while i < len(text):
         match = None
         for c in sorted(clusters, key=len, reverse=True):
-            if text[i:i+len(c)] == c:
+            if text[i:i + len(c)] == c:
                 match = c
                 break
         if match:
@@ -49,92 +94,75 @@ def get_phonemes_hi_gu(text: str) -> List[str]:
             i += 1
     return phonemes
 
-# ---------------- SILENCE DETECTION ----------------
-def detect_silences(audio: AudioSegment, silence_thresh=-40.0, min_silence_len=200) -> List[Tuple[int, int]]:
-    silence_ranges = []
-    window_ms = 50
-    silence_start = None
-    for i in range(0, len(audio), window_ms):
-        segment = audio[i:i + window_ms]
-        if segment.dBFS < silence_thresh:
-            if silence_start is None:
-                silence_start = i
+def analyze_audio_segment(audio: AudioSegment) -> Tuple[np.ndarray, int]:
+    if audio.channels > 1:
+        audio = audio.set_channels(1)
+    if audio.sample_width != 2:
+        audio = audio.set_sample_width(2)
+    samples = np.array(audio.get_array_of_samples())
+    return samples, audio.frame_rate
+
+def detect_silences(audio: AudioSegment, threshold_db: float = -40.0, min_silence_duration: float = 0.1) -> List[Tuple[float, float]]:
+    samples, sr = analyze_audio_segment(audio)
+    samples = samples.astype(np.float32) / 32768.0
+    window_size = int(0.02 * sr)
+    hop_size = window_size // 2
+    rms = []
+    for i in range(0, len(samples), hop_size):
+        window = samples[i:i + window_size]
+        if len(window) == 0:
+            continue
+        rms_val = np.sqrt(np.mean(window**2))
+        rms.append(20 * np.log10(max(rms_val, 1e-10)))
+    silent_windows = [i for i, val in enumerate(rms) if val < threshold_db]
+    silent_periods = []
+    for window_idx in silent_windows:
+        start_time = window_idx * hop_size / sr
+        end_time = (window_idx * hop_size + window_size) / sr
+        if silent_periods and start_time <= silent_periods[-1][1]:
+            silent_periods[-1] = (silent_periods[-1][0], end_time)
         else:
-            if silence_start is not None and (i - silence_start) >= min_silence_len:
-                silence_ranges.append((silence_start, i))
-            silence_start = None
-    if silence_start is not None and (len(audio) - silence_start) >= min_silence_len:
-        silence_ranges.append((silence_start, len(audio)))
-    return silence_ranges
+            silent_periods.append((start_time, end_time))
+    return [(s, e) for s, e in silent_periods if (e - s) >= min_silence_duration]
 
-# ---------------- PHONEME TO VISEME ----------------
-phoneme_to_viseme = {
-    "A": ["aa", "ae", "ah", "ao", "aw", "ay", "a", "e", "i", "o", "u", "uh", "uw"],
-    "B": ["b", "p", "m", "em", "bm"],
-    "C": ["ch", "jh", "sh", "zh"],
-    "D": ["d", "dh", "t", "th", "n", "nd", "nt"],
-    "E": ["eh", "ey", "iy", "y", "ee", "ih"],
-    "F": ["f", "v", "w", "wh"],
-    "G": ["g", "gh", "k", "kh", "ng"],
-    "H": ["h", "hh", "l", "r", "s", "z", "ll", "rr"],
-    "X": [" ", "sil", "sp", "pause"]
-}
-
-def map_to_viseme(phoneme: str) -> str:
-    for viseme, phonemes in phoneme_to_viseme.items():
-        if phoneme in phonemes:
-            return viseme
-    return "X"
-
-# ---------------- CREATE VISEME CUES ----------------
-def create_viseme_cues(phonemes: List[str], duration_ms: int, silences: List[Tuple[int, int]]) -> List[Dict]:
+def create_viseme_cues(phonemes: List[str], duration: float, silences: List[Tuple[float, float]]) -> List[Dict]:
     cues = []
     non_silent_ranges = []
-    last = 0
+    last = 0.0
     for s_start, s_end in silences:
         if last < s_start:
             non_silent_ranges.append((last, s_start))
         last = s_end
-    if last < duration_ms:
-        non_silent_ranges.append((last, duration_ms))
-
+    if last < duration:
+        non_silent_ranges.append((last, duration))
     total_active_duration = sum(e - s for s, e in non_silent_ranges)
     if total_active_duration <= 0 or not phonemes:
         return []
+    phoneme_duration = max(total_active_duration / len(phonemes), 0.05)
 
-    phoneme_duration = total_active_duration / len(phonemes)
-    current_phoneme_index = 0
-
-    for segment in sorted(non_silent_ranges + silences, key=lambda x: x[0]):
-        seg_start, seg_end = segment
+    current_index = 0
+    for seg_start, seg_end in sorted(non_silent_ranges + silences, key=lambda x: x[0]):
         seg_duration = seg_end - seg_start
-
         if (seg_start, seg_end) in silences:
-            cues.append({
-                "value": "X",
-                "start": round(seg_start / 1000, 2),
-                "end": round(seg_end / 1000, 2)
-            })
+            cues.append({"value": "X", "start": round(seg_start, 2), "end": round(seg_end, 2)})
         else:
             t = seg_start
-            while t + phoneme_duration <= seg_end and current_phoneme_index < len(phonemes):
-                ph = phonemes[current_phoneme_index]
+            while t + phoneme_duration <= seg_end and current_index < len(phonemes):
+                ph = phonemes[current_index]
                 viseme = map_to_viseme(ph)
+                end_time = min(t + phoneme_duration, duration)
                 cues.append({
                     "value": viseme,
-                    "start": round(t / 1000, 2),
-                    "end": round((t + phoneme_duration) / 1000, 2)
+                    "start": round(t, 2),
+                    "end": round(end_time, 2)
                 })
                 t += phoneme_duration
-                current_phoneme_index += 1
-
+                current_index += 1
     return cues
 
-# ---------------- MERGE REPEATED VISEMES ----------------
 def merge_repeated_visemes(cues: List[Dict]) -> List[Dict]:
     if not cues:
         return []
-
     merged = [cues[0]]
     for cue in cues[1:]:
         last = merged[-1]
@@ -144,39 +172,43 @@ def merge_repeated_visemes(cues: List[Dict]) -> List[Dict]:
             merged.append(cue)
     return merged
 
-# ---------------- MAIN PROCESS ----------------
-def process(text: str, audio_path: str, output_path: str = "visemes.json"):
-    print("🌐 Detecting language...")
-    lang = detect_language(text)
-    print(f"🈯 Language: {lang}")
+# ---------------- FINAL FUNCTION ----------------
+def generate_lip_sync_json(input_audio_path: str, input_text_path: str, output_json_path: str):
+    print("🚀 Starting lip sync generation...")
 
-    print("🔤 Converting text to phonemes...")
-    phonemes = get_phonemes_en(text) if lang == "en" else get_phonemes_hi_gu(text)
-    print(f"🔡 Phonemes: {phonemes}")
+    try:
+        with open(input_text_path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        if not text:
+            raise ValueError("Text is empty!")
 
-    print("🎧 Loading audio...")
-    audio = AudioSegment.from_file(audio_path).set_channels(1).set_sample_width(2).set_frame_rate(44100)
-    duration_ms = len(audio)
+        lang = detect_language(text)
+        print(f"🌐 Detected language: {lang}")
 
-    print("🔇 Detecting silences...")
-    silences = detect_silences(audio)
-    print(f"⏱️ Duration: {duration_ms}ms | Silences: {silences}")
+        if lang.startswith("en"):
+            phonemes = get_phonemes_en(text)
+        else:
+            phonemes = get_phonemes_hi_gu(text)
+        print(f"🔡 Phonemes: {phonemes}")
 
-    print("🎭 Creating viseme timeline...")
-    cues = create_viseme_cues(phonemes, duration_ms, silences)
+        audio = AudioSegment.from_file(input_audio_path).set_channels(1).set_sample_width(2).set_frame_rate(44100)
+        duration = len(audio) / 1000.0
 
-    print("🪄 Merging repeated visemes...")
-    cues = merge_repeated_visemes(cues)
+        silences = detect_silences(audio)
+        print(f"⏱ Duration: {duration:.2f}s | Silences: {silences}")
 
-    print(f"💾 Saving to {output_path}")
-    with open(output_path, "w") as f:
-        json.dump(cues, f, indent=2)
+        cues = create_viseme_cues(phonemes, duration, silences)
+        cues = merge_repeated_visemes(cues)
 
-    print("✅ Done! Total visemes:", len(cues))
+        for cue in cues:
+            cue["start"] = max(0.0, min(cue["start"], duration))
+            cue["end"] = max(cue["start"], min(cue["end"], duration))
 
-# ---------------- EXAMPLE USAGE ----------------
-if __name__ == "__main__":
-    process(
-        text="I was so happy when I saw you waiting for me at the station. My heart literally jumped, but then I noticed the message on my phone. And I just froze. Why didn't you tell me earlier? I felt so angry like everything was falling apart, and honestly, a part of me was scared. Scared that I'd lose you. Still, right now, just be able to talk to you. It makes me feel calm again. I just hope things can go back to how they were.",
-        audio_path="Harshil.wav"
-    )
+        os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump({"mouthCues": cues}, f, indent=2)
+
+        print(f"✅ Output saved to: {output_json_path}")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
